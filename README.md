@@ -29,6 +29,7 @@ GBBS is a modern implementation of a classic Bulletin Board System (BBS) written
 
 2. Install dependencies:
    ```
+   go mod init gbbs
    go mod tidy
    ```
 
