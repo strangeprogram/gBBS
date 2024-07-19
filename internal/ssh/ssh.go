@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"strings"
 	"time"
 
@@ -14,8 +15,8 @@ import (
 	"golang.org/x/term"
 
 	"gbbs/internal/config"
+	"gbbs/internal/irc"
 	"gbbs/internal/messageboard"
-	"gbbs/internal/prompt"
 	"gbbs/internal/user"
 )
 
@@ -27,22 +28,23 @@ func generateSSHKey() (ssh.Signer, error) {
 	return ssh.NewSignerFromKey(key)
 }
 
-func Serve(cfg *config.Config, userManager *user.Manager, messageBoard *messageboard.MessageBoard) error {
-	signer, err := generateSSHKey()
+func Serve(cfg *config.Config, userManager *user.Manager, messageBoard *messageboard.MessageBoard, ircBridge *irc.Bridge) error {
+	config := &ssh.ServerConfig{
+		NoClientAuth: true,
+	}
+
+	private, err := generateSSHKey()
 	if err != nil {
 		return fmt.Errorf("failed to generate SSH key: %v", err)
 	}
 
-	config := &ssh.ServerConfig{
-		NoClientAuth: true,
-	}
-	config.AddHostKey(signer)
+	config.AddHostKey(private)
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.SSHPort))
 	if err != nil {
 		return err
 	}
-	log.Printf("SSH server listening on port %d", cfg.SSHPort)
+	defer listener.Close()
 
 	for {
 		conn, err := listener.Accept()
@@ -50,11 +52,11 @@ func Serve(cfg *config.Config, userManager *user.Manager, messageBoard *messageb
 			log.Printf("Failed to accept incoming connection: %v", err)
 			continue
 		}
-		go handleConnection(conn, config, cfg, userManager, messageBoard)
+		go handleConnection(conn, config, cfg, userManager, messageBoard, ircBridge)
 	}
 }
 
-func handleConnection(conn net.Conn, config *ssh.ServerConfig, cfg *config.Config, userManager *user.Manager, messageBoard *messageboard.MessageBoard) {
+func handleConnection(conn net.Conn, config *ssh.ServerConfig, cfg *config.Config, userManager *user.Manager, messageBoard *messageboard.MessageBoard, ircBridge *irc.Bridge) {
 	defer conn.Close()
 
 	sshConn, chans, reqs, err := ssh.NewServerConn(conn, config)
@@ -63,8 +65,6 @@ func handleConnection(conn net.Conn, config *ssh.ServerConfig, cfg *config.Confi
 		return
 	}
 	defer sshConn.Close()
-
-	log.Printf("New SSH connection from %s (%s)", sshConn.RemoteAddr(), sshConn.ClientVersion())
 
 	go ssh.DiscardRequests(reqs)
 
@@ -81,84 +81,79 @@ func handleConnection(conn net.Conn, config *ssh.ServerConfig, cfg *config.Confi
 
 		go func(in <-chan *ssh.Request) {
 			for req := range in {
-				ok := false
 				switch req.Type {
 				case "shell":
-					ok = true
-					if len(req.Payload) > 0 {
-						ok = false
-					}
+					req.Reply(true, nil)
 				case "pty-req":
-					ok = true
+					req.Reply(true, nil)
 				}
-				req.Reply(ok, nil)
 			}
 		}(requests)
 
-		term := term.NewTerminal(channel, "> ")
-		go handleSSHSession(term, cfg, userManager, messageBoard)
+		terminal := term.NewTerminal(channel, "")
+		go handleSSHSession(terminal, cfg, userManager, messageBoard, ircBridge)
 	}
 }
 
-func handleSSHSession(term *term.Terminal, cfg *config.Config, userManager *user.Manager, messageBoard *messageboard.MessageBoard) {
-	defer term.Write([]byte("Goodbye!\n"))
+func handleSSHSession(terminal *term.Terminal, cfg *config.Config, userManager *user.Manager, messageBoard *messageboard.MessageBoard, ircBridge *irc.Bridge) {
+	defer terminal.Write([]byte("Goodbye!\n"))
 
-	welcomeScreen, err := prompt.ReadWelcomeScreen(cfg)
+	welcomeScreen, err := os.ReadFile(cfg.WelcomeScreenPath)
 	if err != nil {
-		fmt.Fprintf(term, "Error reading welcome screen: %v\n", err)
-		return
+		log.Printf("Error reading welcome screen: %v", err)
+		terminal.Write([]byte("Welcome to GBBS!\n\n"))
+	} else {
+		terminal.Write(welcomeScreen)
 	}
-
-	term.Write([]byte(welcomeScreen))
-	term.Write([]byte("\n\n\n\n\n")) // new lines to make it look real nice yo
+	terminal.Write([]byte("\n\n\n\n\n")) // Add five newlines after the welcome screen
 
 	for {
-		term.SetPrompt("\033[0;32mChoose (L)ogin or (R)egister: \033[0m")
-		choice, err := term.ReadLine()
+		terminal.SetPrompt("\033[0;32mChoose (L)ogin or (R)egister: \033[0m")
+		choice, err := terminal.ReadLine()
 		if err != nil {
 			if err == io.EOF {
 				return
 			}
-			fmt.Fprintf(term, "\033[0;31mError reading input: %v\033[0m\n", err)
+			log.Printf("Error reading input: %v", err)
 			continue
 		}
 
-		switch strings.ToLower(strings.TrimSpace(choice)) {
+		switch strings.ToLower(choice) {
 		case "l":
-			username, err := login(term, userManager)
+			username, err := login(terminal, userManager)
 			if err != nil {
-				fmt.Fprintf(term, "\033[0;31mLogin failed: %v\033[0m\n", err)
+				terminal.Write([]byte(fmt.Sprintf("\033[0;31mLogin failed: %v\033[0m\n", err)))
 				continue
 			}
-			fmt.Fprintf(term, "\n\033[1;32mLogin successful! Welcome, %s!\033[0m\n", username)
+			terminal.Write([]byte(fmt.Sprintf("\n\033[1;32mLogin successful! Welcome, %s!\033[0m\n", username)))
 			time.Sleep(2 * time.Second)
-			handleBBS(term, username, messageBoard)
+			handleBBS(username, terminal, messageBoard, ircBridge)
 			return
 		case "r":
-			username, err := register(term, userManager)
+			username, err := register(terminal, userManager)
 			if err != nil {
-				fmt.Fprintf(term, "\033[0;31mRegistration failed: %v\033[0m\n", err)
+				terminal.Write([]byte(fmt.Sprintf("\033[0;31mRegistration failed: %v\033[0m\n", err)))
 				continue
 			}
-			fmt.Fprintf(term, "\n\033[1;32mRegistration successful! Welcome, %s!\033[0m\n", username)
+			terminal.Write([]byte(fmt.Sprintf("\n\033[1;32mRegistration successful! Welcome, %s!\033[0m\n", username)))
 			time.Sleep(2 * time.Second)
-			handleBBS(term, username, messageBoard)
+			handleBBS(username, terminal, messageBoard, ircBridge)
 			return
 		default:
-			fmt.Fprintf(term, "\033[0;31mInvalid choice. Please enter 'L' or 'R'.\033[0m\n")
+			terminal.Write([]byte("\033[0;31mInvalid choice. Please enter 'L' or 'R'.\033[0m\n"))
 		}
 	}
 }
 
-func login(term *term.Terminal, userManager *user.Manager) (string, error) {
-	term.SetPrompt("Username: ")
-	username, err := term.ReadLine()
+func login(terminal *term.Terminal, userManager *user.Manager) (string, error) {
+	terminal.SetPrompt("Username: ")
+	username, err := terminal.ReadLine()
 	if err != nil {
 		return "", err
 	}
 
-	term.SetPrompt("Password: ")
-	password, err := term.ReadPassword("Password: ")
+	terminal.SetPrompt("Password: ")
+	password, err := terminal.ReadPassword("Password: ")
 	if err != nil {
 		return "", err
 	}
@@ -174,15 +169,15 @@ func login(term *term.Terminal, userManager *user.Manager) (string, error) {
 	return username, nil
 }
 
-func register(term *term.Terminal, userManager *user.Manager) (string, error) {
-	term.SetPrompt("Choose a username: ")
-	username, err := term.ReadLine()
+func register(terminal *term.Terminal, userManager *user.Manager) (string, error) {
+	terminal.SetPrompt("Choose a username: ")
+	username, err := terminal.ReadLine()
 	if err != nil {
 		return "", err
 	}
 
-	term.SetPrompt("Choose a password: ")
-	password, err := term.ReadPassword("Choose a password: ")
+	terminal.SetPrompt("Choose a password: ")
+	password, err := terminal.ReadPassword("Choose a password: ")
 	if err != nil {
 		return "", err
 	}
@@ -195,17 +190,18 @@ func register(term *term.Terminal, userManager *user.Manager) (string, error) {
 	return username, nil
 }
 
-func handleBBS(term *term.Terminal, username string, messageBoard *messageboard.MessageBoard) {
+func handleBBS(username string, terminal *term.Terminal, messageBoard *messageboard.MessageBoard, ircBridge *irc.Bridge) {
 	for {
-		term.Write([]byte("\n\033[0;36mBBS Menu:\033[0m\n"))
-		term.Write([]byte("1. Read messages\n"))
-		term.Write([]byte("2. Post message\n"))
-		term.Write([]byte("3. Logout\n"))
-		term.SetPrompt("Choice: ")
+		terminal.Write([]byte("\n\033[0;36mBBS Menu:\033[0m\n"))
+		terminal.Write([]byte("1. Read messages\n"))
+		terminal.Write([]byte("2. Post message\n"))
+		terminal.Write([]byte("3. IRC Bridge\n"))
+		terminal.Write([]byte("4. Logout\n"))
+		terminal.SetPrompt("Choice: ")
 
-		choice, err := term.ReadLine()
+		choice, err := terminal.ReadLine()
 		if err != nil {
-			fmt.Fprintf(term, "\033[0;31mError reading input: %v\033[0m\n", err)
+			log.Printf("Error reading input: %v", err)
 			continue
 		}
 
@@ -213,29 +209,92 @@ func handleBBS(term *term.Terminal, username string, messageBoard *messageboard.
 		case "1":
 			messages, err := messageBoard.GetMessages()
 			if err != nil {
-				fmt.Fprintf(term, "\033[0;31mError reading messages: %v\033[0m\n", err)
+				terminal.Write([]byte(fmt.Sprintf("\033[0;31mError reading messages: %v\033[0m\n", err)))
 			} else {
 				for _, msg := range messages {
-					fmt.Fprintf(term, "%s\n", msg)
+					terminal.Write([]byte(fmt.Sprintf("%s\n", msg)))
 				}
 			}
 		case "2":
-			term.SetPrompt("Enter your message: ")
-			message, err := term.ReadLine()
+			terminal.SetPrompt("Enter your message: ")
+			message, err := terminal.ReadLine()
 			if err != nil {
-				fmt.Fprintf(term, "\033[0;31mError reading message: %v\033[0m\n", err)
+				terminal.Write([]byte(fmt.Sprintf("\033[0;31mError reading message: %v\033[0m\n", err)))
 				continue
 			}
 			err = messageBoard.PostMessage(username, message)
 			if err != nil {
-				fmt.Fprintf(term, "\033[0;31mError posting message: %v\033[0m\n", err)
+				terminal.Write([]byte(fmt.Sprintf("\033[0;31mError posting message: %v\033[0m\n", err)))
 			} else {
-				fmt.Fprintf(term, "\033[0;32mMessage posted successfully!\033[0m\n")
+				terminal.Write([]byte("\033[0;32mMessage posted successfully!\033[0m\n"))
 			}
 		case "3":
+			handleIRCBridge(username, terminal, ircBridge)
+		case "4":
 			return
 		default:
-			fmt.Fprintf(term, "\033[0;31mInvalid choice. Please try again.\033[0m\n")
+			terminal.Write([]byte("\033[0;31mInvalid choice. Please try again.\033[0m\n"))
+		}
+	}
+}
+
+func handleIRCBridge(username string, terminal *term.Terminal, ircBridge *irc.Bridge) {
+	if ircBridge == nil {
+		terminal.Write([]byte("\033[0;31mIRC Bridge is not enabled.\033[0m\n"))
+		return
+	}
+
+	terminal.Write([]byte("\033[0;36mEntering IRC Bridge mode. Type '/quit' to exit.\033[0m\n"))
+
+	// Fetch recent messages
+	recentMessages, err := ircBridge.GetRecentMessages(50) // Get last 50 messages
+	if err != nil {
+		terminal.Write([]byte(fmt.Sprintf("\033[0;31mError fetching recent messages: %v\033[0m\n", err)))
+	} else {
+		for _, msg := range recentMessages {
+			terminal.Write([]byte(fmt.Sprintf("%s\n", msg)))
+		}
+	}
+
+	ircMsgChan := ircBridge.GetMessageChannel()
+	quit := make(chan struct{})
+
+	// Goroutine to handle incoming IRC messages
+	go func() {
+		for {
+			select {
+			case msg := <-ircMsgChan:
+				terminal.Write([]byte(fmt.Sprintf("\r%s\n> ", msg)))
+			case <-quit:
+				return
+			}
+		}
+	}()
+
+	// Main loop for user input
+	for {
+		terminal.SetPrompt("> ")
+		input, err := terminal.ReadLine()
+		if err != nil {
+			if err == io.EOF {
+				close(quit)
+				return
+			}
+			log.Printf("Error reading input: %v", err)
+			continue
+		}
+
+		input = strings.TrimSpace(input)
+
+		if input == "/quit" {
+			close(quit)
+			terminal.Write([]byte("\033[0;36mExiting IRC Bridge mode.\033[0m\n"))
+			return
+		}
+
+		// Send user message to IRC
+		for _, channel := range ircBridge.Config.Channels {
+			ircBridge.SendMessage(channel.Name, username, input)
 		}
 	}
 }

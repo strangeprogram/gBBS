@@ -1,0 +1,21 @@
+{
+    "telnet_port": 2323,
+    "ssh_port": 2222,
+    "web_port": 8080,
+    "guestbook_path": "guestbook.txt",
+    "web_root": "web",
+    "welcome_screen_path": "welcome.ans",
+    "irc_bridge": {
+        "enabled": true,
+        "server": "irc.supernets.org",
+        "port": 6697,
+        "use_ssl": true,
+        "nick": "GBBSBridge",
+        "channels": [
+            {
+                "name": "#dev",
+                "password": ""
+            }
+        ]
+    }
+}

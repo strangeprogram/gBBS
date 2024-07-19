@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"strings"
 	"sync"
 	"time"
 )
@@ -49,13 +48,14 @@ func (mb *MessageBoard) GetMessages() ([]string, error) {
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
 
-	content, err := os.ReadFile(mb.filePath)
+	file, err := os.Open(mb.filePath)
 	if err != nil {
 		return nil, err
 	}
+	defer file.Close()
 
-	scanner := bufio.NewScanner(strings.NewReader(string(content)))
 	var messages []string
+	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		messages = append(messages, scanner.Text())
 	}
